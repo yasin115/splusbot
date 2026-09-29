@@ -1285,7 +1285,7 @@ LOCK_DISPLAY_NAMES = {
     "live": "لایو", "emoji": "اموجی", "text": "متن", "sticker": "استیکر",
     "reply": "ریپلای", "hangcode": "کد هنگی", "join_duplicate": "جوین تکراری",
     "english": "انگلیسی", "spam": "اسپم", "ad": "تبلیغ", "badword": "فحش/متن نامناسب",
-    "entertainment": "سرگرمی",
+    "bio_link": "بیو (لینک)", "entertainment": "سرگرمی",
 }
 # کلیدهایی که قفل‌بودنشون از جدولِ locks نمیاد، بلکه از auto_mod_settings میاد.
 LOCK_AUTOMOD_FIELDS = {"spam": "spam_enabled", "ad": "ad_enabled", "badword": "badword_enabled"}
@@ -1355,7 +1355,8 @@ def apply_default_group_locks(chat_id):
             chat_id,
             spam_enabled=True,
             ad_enabled=True,
-            badword_enabled=True,
+            # فحش به‌صورت پیش‌فرض بازه؛ فقط وقتی مالک/ادمین قفلش کنه روشن می‌شه.
+            badword_enabled=False,
             silent_mode=False,
         )
     except Exception as e:
@@ -2754,6 +2755,203 @@ async def announce_and_register_group_admins(chat_id, send_message=True):
         print(f"[admin_announce] ثبت انجام شد ولی ارسال پیام تگ شکست خورد: {e}")
         return False
 
+
+# ==================== دسترسیِ پنلِ مرکزی + فعال‌سازیِ خودکار ====================
+# فقط این سطح‌ها اجازه‌ی افزودن/مدیریتِ گروه از پنلِ مرکزی (manager.py) دارن.
+# عمداً «db_admin» (ادمینِ عمومیِ همین سلف) و «member» توش نیست.
+PANEL_ALLOWED_LEVELS = ("super_owner", "creator", "admin", "group_owner")
+_PANEL_ACCESS_CACHE = {}     # (chat_id, user_id) -> (timestamp, level)
+_PANEL_ACCESS_TTL = 20
+_PANEL_JOINS_IN_FLIGHT = 0   # تعداد جوین‌های پنل که هنوز چکِ ادمین‌شون تموم نشده
+AUTO_ACTIVATED_AT = {}       # chat_id -> timestamp آخرین فعال‌سازیِ خودکار
+_AUTO_ACTIVATE_INFLIGHT = set()
+
+
+async def get_panel_access_level(chat_id, user_id, fresh=False):
+    """سطحِ واقعیِ کاربر در همین گروه رو (زنده از سروش) برمی‌گردونه:
+    super_owner / creator / admin / group_owner / member / unknown.
+    نتیجه‌ی زنده‌ی «member» بر ثبتِ قدیمیِ دیتابیس غلبه می‌کنه (ادمینِ برکنارشده
+    دیگه دسترسی نداره). فقط وقتی سروش جواب نده (unknown) به مالکِ ثبت‌شده‌ی
+    دیتابیس برمی‌گردیم. هر خطایی = عدمِ دسترسی (fail-closed)."""
+    try:
+        chat_id = int(chat_id)
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        return "unknown"
+    if user_id in SUPER_OWNER_IDS:
+        return "super_owner"
+
+    key = (chat_id, user_id)
+    now = time.time()
+    if not fresh:
+        hit = _PANEL_ACCESS_CACHE.get(key)
+        if hit and now - hit[0] < _PANEL_ACCESS_TTL:
+            return hit[1]
+
+    live = None
+    try:
+        perms = await client.get_permissions(chat_id, user_id)
+        if getattr(perms, "is_creator", False):
+            live = "creator"
+        elif getattr(perms, "is_admin", False):
+            live = "admin"
+        else:
+            live = "member"
+    except Exception:
+        live = None
+
+    level = live
+    if live not in ("creator", "admin"):
+        # بعضی بک‌اندها نقش رو از get_permissions نمی‌دن؛ لیستِ ادمین‌ها رو هم چک کن.
+        try:
+            data = await (_scan_group_admins(chat_id) if fresh else get_group_admins(chat_id))
+            if data.get("creator") is not None and int(data["creator"]) == user_id:
+                level = "creator"
+            elif user_id in [int(a) for a in (data.get("admins") or [])]:
+                level = "admin"
+        except Exception:
+            pass
+    if level not in ("creator", "admin"):
+        if live is None:
+            try:
+                level = "group_owner" if db.is_group_owner(chat_id, user_id) else "unknown"
+            except Exception:
+                level = "unknown"
+        else:
+            level = "member"
+
+    if level == "creator":
+        try:
+            if not db.get_group_owner(chat_id):
+                db.set_group_owner(chat_id, user_id)
+                db.add_group_admin(chat_id, user_id)
+        except Exception:
+            pass
+    _PANEL_ACCESS_CACHE[key] = (now, level)
+    if len(_PANEL_ACCESS_CACHE) > 5000:
+        for k in sorted(_PANEL_ACCESS_CACHE, key=lambda k: _PANEL_ACCESS_CACHE[k][0])[:1000]:
+            _PANEL_ACCESS_CACHE.pop(k, None)
+    return level
+
+
+async def auto_activate_group(chat_id, group_name=None, force=False):
+    """معادلِ «فعال» ولی بدونِ اینکه کسی توی گروه چیزی بنویسه: مالکِ واقعی و
+    ادمین‌ها رو از خودِ سروش می‌گیره، مالکِ گروه رو ثبت می‌کنه، روزشمار و
+    تنظیماتِ کارخانه رو اعمال می‌کنه و یک پیامِ کوتاه با لیستِ مدیران می‌فرسته.
+    idempotent: برای یک گروه در ۱۰ دقیقه بیشتر از یک‌بار اجرا نمی‌شه."""
+    global BOT_ID
+    try:
+        chat_id = int(chat_id)
+    except (TypeError, ValueError):
+        return None
+    now = time.time()
+    if not force and now - AUTO_ACTIVATED_AT.get(chat_id, 0) < 600:
+        return None
+    if chat_id in _AUTO_ACTIVATE_INFLIGHT:
+        return None
+    _AUTO_ACTIVATE_INFLIGHT.add(chat_id)
+    try:
+        AUTO_ACTIVATED_AT[chat_id] = now
+        if BOT_ID is None:
+            try:
+                BOT_ID = (await client.get_me()).id
+            except Exception:
+                pass
+
+        # اسکنِ تازه (چند تلاش، چون بلافاصله بعد از ورود ممکنه لیست کامل نباشه)
+        admins_data = {"admins": [], "creator": None}
+        for attempt in range(3):
+            try:
+                GROUP_ADMINS_CACHE.pop(chat_id, None)
+                GROUP_ADMINS_CACHE_TIME.pop(chat_id, None)
+                GROUP_ADMINS_REFRESHING.discard(chat_id)
+                admins_data = await _scan_group_admins(chat_id)
+                if admins_data.get("creator") or admins_data.get("admins"):
+                    break
+            except Exception as e:
+                safe_print(f"[auto_activate] اسکن {chat_id} تلاش {attempt + 1}: {e}")
+            await asyncio.sleep(1.2)
+
+        creator_id = admins_data.get("creator")
+        if creator_id and BOT_ID is not None and int(creator_id) == int(BOT_ID):
+            creator_id = None
+
+        newly_owned = False
+        if creator_id:
+            try:
+                if db.set_group_owner(chat_id, int(creator_id)):
+                    newly_owned = True
+                db.add_group_admin(chat_id, int(creator_id))
+                GROUP_OWNER_CACHE[chat_id] = db.get_group_owner(chat_id) or int(creator_id)
+            except Exception as e:
+                safe_print(f"[auto_activate] ثبت مالک: {e}")
+        await _record_group_activation_safe(chat_id)
+
+        if newly_owned:
+            # همون «تنظیمات کارخانه‌ی اولین فعال»
+            try:
+                db.set_lock(chat_id, "link", True, action="warn")
+                db.set_lock(chat_id, "spam", True, action="warn")
+                db.set_lock(chat_id, "hangcode", True, action="ban")
+                db.set_auto_mod_settings(chat_id, spam_enabled=True, silent_mode=False)
+            except Exception as e:
+                safe_print(f"[auto_activate] تنظیمات کارخانه: {e}")
+
+        # ثبتِ ادمین‌ها در تیرِ «ادمین» (بدونِ ارسالِ پیام؛ متن رو خودمون می‌سازیم)
+        admin_msg = None
+        try:
+            admin_msg = await announce_and_register_group_admins(chat_id, send_message=False)
+        except Exception as e:
+            safe_print(f"[auto_activate] ثبت ادمین‌ها: {e}")
+
+        try:
+            owner_id = db.get_group_owner(chat_id)
+        except Exception:
+            owner_id = None
+        lines = [f"✅ **ربات «{BOT_DISPLAY_LABEL}» به‌صورت خودکار فعال شد**", ""]
+        if owner_id:
+            try:
+                owner_view = view_tag(owner_id, await get_username(client, owner_id))
+                lines.append(f"👑 **مالک گروه:** {owner_view}")
+            except Exception:
+                lines.append("👑 مالک گروه شناسایی و ثبت شد.")
+        else:
+            lines.append("⚠️ مالکِ گروه از سروش مشخص نشد؛ یکی از ادمین‌ها بنویسه `فعال`.")
+        if isinstance(admin_msg, str) and admin_msg:
+            lines += ["", admin_msg]
+        lines += ["", "🔹 برای مشاهده‌ی دستورها بنویسید `راهنما`", "🔹 برای کارکردِ کاملِ قفل‌ها، ربات رو ادمین کنید."]
+        try:
+            await client.send_message(chat_id, "\n".join(lines))
+        except Exception as e:
+            safe_print(f"[auto_activate] ارسالِ پیامِ فعال‌سازی ناموفق: {e}")
+
+        return {"creator": creator_id, "admins": list(admins_data.get("admins") or [])}
+    finally:
+        _AUTO_ACTIVATE_INFLIGHT.discard(chat_id)
+
+
+async def _on_bot_added_to_group(chat_id):
+    """ربات به گروه اضافه شد (دستی یا با هر روشی): فعال‌سازیِ خودکار + اعلام به
+    رجیستری. اگه همون لحظه یک جوینِ پنلِ مرکزی در حالِ چکِ ادمینه، صبر می‌کنیم
+    تا اگه ربات به‌خاطرِ «ادمین نبودنِ درخواست‌دهنده» از گروه خارج شد، هیچ
+    پیام/ثبتی توی اون گروه انجام نشه."""
+    waited = 0.0
+    while _PANEL_JOINS_IN_FLIGHT > 0 and waited < 60:
+        await asyncio.sleep(1.5)
+        waited += 1.5
+    if waited:
+        try:
+            await client.get_permissions(chat_id, 'me')
+        except Exception:
+            return  # دیگه عضو نیستیم
+    await auto_activate_group(chat_id)
+    if GROUP_REGISTRY_API_URL:
+        try:
+            group_title = getattr(await client.get_entity(chat_id), 'title', None)
+        except Exception:
+            group_title = None
+        asyncio.create_task(registry_announce_group(chat_id, group_title))
+
 PERMISSION_CACHE = {}
 PERMISSION_CACHE_TIME = {}
 AUTO_REGISTERED_ADMINS = set()
@@ -3384,12 +3582,37 @@ async def _confirm_left(chat_id):
     اگه نتونیم مطمئن بشیم (خودِ چک‌کردن هم خطا داد)، None برمی‌گردونیم تا صدازننده
     نتیجه‌ی اولیه رو قبول کنه - نمی‌خوایم یک خطای موقتِ شبکه باعث بشه یک لفتِ
     واقعاً موفق، ناموفق گزارش بشه."""
+    # مسیر سریع: یک RPC سبک به‌جای کشیدنِ کلِ لیستِ دیالوگ‌ها (که با زیاد شدنِ
+    # گروه‌ها ثانیه‌ها طول می‌کشه). فقط «قطعاً خارج شده» رو باور می‌کنیم؛ هر حالتِ
+    # دیگه (هنوز عضو/نامشخص) مثلِ قبل با get_dialogs (منبعِ قابل‌اعتماد) تصمیم می‌گیره.
+    if await _fast_left_probe(chat_id) is True:
+        return True
     try:
         dialogs = await client.get_dialogs()
     except Exception:
         return None
     still_there = any(getattr(d, "id", None) == chat_id for d in dialogs)
     return not still_there
+
+
+async def _fast_left_probe(chat_id):
+    """True فقط وقتی مطمئنیم ربات دیگه عضوِ این گروه نیست (خطای صریحِ «عضو نیستی»
+    یا participantِ Left/Banned)؛ در هر حالتِ دیگه None."""
+    try:
+        perms = await asyncio.wait_for(client.get_permissions(chat_id, 'me'), timeout=6)
+    except asyncio.TimeoutError:
+        return None
+    except Exception as e:
+        msg = str(e).lower()
+        return True if any(k in msg for k in _GONE_ERR_MARKERS) else None
+    participant = getattr(perms, 'participant', None)
+    pname = type(participant).__name__.lower() if participant is not None else ""
+    if "banned" in pname or pname.endswith("left"):
+        return True
+    rights = getattr(participant, 'banned_rights', None)
+    if rights and bool(getattr(rights, 'view_messages', False)):
+        return True
+    return None
 
 
 async def _try_leave_chat(entity, chat_id):
@@ -3809,6 +4032,7 @@ async def join_group_via_link(event, text):
     # ثبتِ حضورِ خودمون توی رجیستری سراسری - تا هیچ نمونه‌ی دیگه‌ای بعد از این
     # لحظه، همین گروه رو «آزاد» نبینه.
     asyncio.create_task(registry_announce_group(join_chat_id, group_name))
+    asyncio.create_task(auto_activate_group(join_chat_id, group_name))
 
     is_exempt_sender = sender_id is not None and sender_id in SUPER_OWNER_IDS
     remaining = MAX_JOIN_LINKS_PER_USER
@@ -3830,7 +4054,7 @@ async def join_group_via_link(event, text):
 
 📋 مراحل بعد:
 1️⃣ ربات رو ادمین کن
-2️⃣ توی گروه بنویس `فعال`
+2️⃣ فعال‌سازی خودکار انجام شد (مالک و ادمین‌های گروه شناسایی می‌شن)
 
 {remaining_line}
 {_count_unknown_line}
@@ -3914,18 +4138,21 @@ async def perform_membership_check(link_text, requester_uid=None):
             req_uid_int = None
         if req_uid_int is not None:
             try:
-                level = await check_user_permission(chat_id, req_uid_int)
-                authorized = level in ("super_owner", "creator", "admin", "group_owner", "db_admin")
+                level = await get_panel_access_level(chat_id, req_uid_int, fresh=True)
+                authorized = level in PANEL_ALLOWED_LEVELS
             except Exception:
                 authorized = False
+            if authorized:
+                # گروه از قبل بوده ولی شاید هنوز فعال/ثبت‌مالک نشده؛ idempotent
+                asyncio.create_task(auto_activate_group(chat_id))
 
     return {
         "ok": True, "already_member": True, "chat_id": chat_id,
-        "group_name": group_name, "authorized": authorized,
+        "group_name": group_name, "authorized": authorized, "bot": BOT_DISPLAY_LABEL,
     }
 
 
-async def perform_admin_join_test(link_text):
+async def perform_admin_join_test(link_text, requester_uid=None):
     """نسخه‌ی سبک‌ترِ join_group_via_link که مستقیماً از پنلِ مرکزی
     (manager.py، از طریقِ همون کانالِ broadcast/ack) دستور داده می‌شه - نه
     از یک پیامِ PM. برخلافِ join_group_via_link:
@@ -3944,7 +4171,9 @@ async def perform_admin_join_test(link_text):
 
     is_private_hash = "joinchat" in link.lower() or "joingroup" in link.lower() or "/+" in link
 
-    if not is_private_hash and GROUP_REGISTRY_API_URL:
+    async def _public_registry_preview():
+        if is_private_hash or not GROUP_REGISTRY_API_URL:
+            return None
         try:
             preview_entity = await client.get_entity(identifier)
             # همون دلیلِ join_group_via_link: آیدیِ مارک‌دار می‌خوایم، نه خامِ entity.id.
@@ -3955,8 +4184,14 @@ async def perform_admin_join_test(link_text):
             occupied, owner_label, _ = await registry_check_group(preview_chat_id)
             if occupied:
                 return {"ok": False, "error": f"از قبل ربات «{owner_label}» توی این گروهه."}
+        return None
 
-    _pre_count = await _precheck_link_member_count(link, identifier)
+    # این دو چک مستقل‌اند؛ پشت‌سرهم نیستن، هم‌زمان اجرا می‌شن.
+    _early_err, _pre_count = await asyncio.gather(
+        _public_registry_preview(), _precheck_link_member_count(link, identifier)
+    )
+    if _early_err:
+        return _early_err
     if _pre_count is not None and _pre_count < MIN_GROUP_MEMBERS:
         return {"ok": False, "error": _too_small_message(_pre_count)}
 
@@ -3983,7 +4218,67 @@ async def perform_admin_join_test(link_text):
     raw_name = getattr(entity, 'title', None) or getattr(entity, 'name', None)
     group_name = raw_name or "گروه"
 
-    _member_count = await _probe_member_count(entity, join_chat_id)
+    # ---- سه چکِ «فقط‌خوندنی» که به‌هم وابسته نیستن، هم‌زمان اجرا می‌شن ----
+    # (قبلاً پشت‌سرهم بودن: چکِ ادمین ← شمارشِ اعضا (چندین RPC) ← رجیستری.)
+    # تصمیم‌گیری پایین دقیقاً با همون اولویتِ قبلی انجام می‌شه: اول ادمین، بعد
+    # تعدادِ اعضا، بعد رجیستری.
+    async def _requester_level():
+        try:
+            req_uid_int = int(requester_uid)
+        except (TypeError, ValueError):
+            return "unknown"
+        level = "unknown"
+        for attempt in range(3):
+            level = await get_panel_access_level(join_chat_id, req_uid_int, fresh=True)
+            if level in PANEL_ALLOWED_LEVELS:
+                break
+            if attempt < 2:
+                await asyncio.sleep(0.8)   # لیستِ اعضا بعد از ورود ممکنه کمی دیر آماده بشه
+        return level
+
+    async def _members_count():
+        # اگه قبل از جوین از خودِ لینک شمرده بودیم، دوباره پروب نمی‌کنیم.
+        if _pre_count is not None:
+            return _pre_count
+        return await _probe_member_count(entity, join_chat_id)
+
+    async def _registry_state():
+        if not GROUP_REGISTRY_API_URL:
+            return (None, None, None)
+        return await registry_check_group(join_chat_id)
+
+    async def _no_check():
+        return None
+
+    level, _member_count, _reg = await asyncio.gather(
+        _requester_level() if requester_uid is not None else _no_check(),
+        _members_count(),
+        _registry_state(),
+        return_exceptions=True,
+    )
+    if isinstance(level, Exception):
+        level = "unknown"          # fail-closed: چک نشد = دسترسی نیست
+    if isinstance(_member_count, Exception):
+        _member_count = None
+    if isinstance(_reg, Exception):
+        _reg = (None, None, None)
+
+    # ---- فقط مالک/ادمینِ واقعیِ گروه حق داره گروه رو از پنل اضافه کنه ----
+    # هنوز هیچ چیزی (پیام، دیتابیس، رجیستری) ثبت نشده؛ اگه درخواست‌دهنده ادمین
+    # نبود، بی‌سروصدا لفت می‌دیم.
+    if requester_uid is not None and level not in PANEL_ALLOWED_LEVELS:
+        left_ok, leave_error = await _try_leave_chat(entity, join_chat_id)
+        try:
+            db.remove_auto_joined_group(join_chat_id)
+        except Exception:
+            pass
+        detail = "" if left_ok else f" (لفت ناموفق: {leave_error})"
+        return {
+            "ok": False, "not_admin": True, "group_name": group_name, "left": bool(left_ok),
+            "bot": BOT_DISPLAY_LABEL,
+            "error": f"درخواست‌دهنده مالک/ادمینِ گروه «{group_name}» نیست؛ ربات «{BOT_DISPLAY_LABEL}» خارج شد{detail}.",
+        }
+
     if _member_count is not None and _member_count < MIN_GROUP_MEMBERS:
         left_ok, leave_error = await _try_leave_chat(entity, join_chat_id)
         detail = " (لفت داده شد)" if left_ok else f" (لفت هم ناموفق: {leave_error})"
@@ -3991,12 +4286,11 @@ async def perform_admin_join_test(link_text):
     if _member_count is None:
         asyncio.create_task(_small_group_guard(join_chat_id, raw_name or "گروه", None))
 
-    if GROUP_REGISTRY_API_URL:
-        occupied, owner_label, _ = await registry_check_group(join_chat_id)
-        if occupied:
-            left_ok, leave_error = await _try_leave_chat(entity, join_chat_id)
-            detail = " (لفت داده شد)" if left_ok else f" (لفت هم ناموفق: {leave_error})"
-            return {"ok": False, "error": f"ربات «{owner_label}» از قبل توی «{group_name}» بود{detail}."}
+    occupied, owner_label, _ = _reg
+    if occupied:
+        left_ok, leave_error = await _try_leave_chat(entity, join_chat_id)
+        detail = " (لفت داده شد)" if left_ok else f" (لفت هم ناموفق: {leave_error})"
+        return {"ok": False, "error": f"ربات «{owner_label}» از قبل توی «{group_name}» بود{detail}."}
 
     try:
         baseline = db.get_stats(join_chat_id).get("total_messages", 0) or 0
@@ -4020,8 +4314,57 @@ async def perform_admin_join_test(link_text):
         safe_print(f"[perform_admin_join_test] خطا در ثبت گروه «{group_name}» در دیتابیس: {e}")
 
     asyncio.create_task(registry_announce_group(join_chat_id, group_name))
+    # فعال‌سازیِ خودکار: مالک و ادمین‌ها رو از سروش می‌گیره، بدونِ نوشتنِ «فعال»
+    asyncio.create_task(auto_activate_group(join_chat_id, group_name))
 
-    return {"ok": True, "group_name": group_name, "chat_id": join_chat_id, "error": None}
+    return {"ok": True, "group_name": group_name, "chat_id": join_chat_id, "bot": BOT_DISPLAY_LABEL, "error": None}
+
+
+
+_GONE_ERR_MARKERS = (
+    "channel_private", "channelprivate", "kicked", "banned", "not a member", "not participant",
+    "user_not_participant", "chat_forbidden", "chat forbidden", "you can't access", "cannot access",
+    "no user has", "chat not found", "peer_id_invalid",
+)
+
+
+async def bot_membership_state(chat_id):
+    """وضعیتِ واقعیِ خودِ این ربات توی گروه: "member" | "gone" | "unknown".
+    gone = بن/اخراج شده یا خودش لفت داده (دیگه عضو نیست). unknown = نتونستیم مطمئن بشیم
+    (مثلاً خطای شبکه) - در این حالت هیچ‌چیزی حذف نمی‌شه."""
+    try:
+        chat_id = int(chat_id)
+    except (TypeError, ValueError):
+        return "unknown"
+    try:
+        perms = await client.get_permissions(chat_id, 'me')
+    except Exception as e:
+        msg = str(e).lower()
+        if any(k in msg for k in _GONE_ERR_MARKERS):
+            return "gone"
+        confirmed = await _confirm_left(chat_id)   # True = توی دیالوگ‌ها نیست
+        return "gone" if confirmed is True else "unknown"
+    participant = getattr(perms, 'participant', None)
+    pname = type(participant).__name__.lower() if participant is not None else ""
+    if "banned" in pname or pname.endswith("left"):
+        return "gone"
+    rights = getattr(participant, 'banned_rights', None)
+    if rights and bool(getattr(rights, 'view_messages', False)):
+        return "gone"
+    return "member"
+
+
+async def _cleanup_after_bot_gone(chat_id):
+    """ربات دیگه توی این گروه نیست؛ ردپاش از لیستِ چکِ فعالیت و رجیستری پاک بشه."""
+    try:
+        db.remove_auto_joined_group(chat_id)
+    except Exception:
+        pass
+    if GROUP_REGISTRY_API_URL:
+        try:
+            await registry_leave_group(chat_id)
+        except Exception:
+            pass
 
 
 async def perform_admin_leave_group(chat_id):
@@ -4031,18 +4374,26 @@ async def perform_admin_leave_group(chat_id):
         chat_id = int(chat_id)
     except (TypeError, ValueError):
         return {"ok": False, "error": "chat_id نامعتبر."}
+    # اگه ربات از قبل از این گروه بن/اخراج شده (یا لفت داده)، نیازی به لفت نیست.
+    if await bot_membership_state(chat_id) == "gone":
+        await _cleanup_after_bot_gone(chat_id)
+        return {"ok": True, "chat_id": chat_id, "already_left": True, "bot": BOT_DISPLAY_LABEL, "error": None}
     try:
         entity = await client.get_entity(chat_id)
     except Exception:
         entity = chat_id
     left_ok, leave_error = await _try_leave_chat(entity, chat_id)
     if not left_ok:
-        return {"ok": False, "error": str(leave_error) or "نامشخص"}
+        # شاید همین الان بن/اخراج شده باشه؛ یک بار دیگه وضعیت رو بسنج.
+        if await bot_membership_state(chat_id) == "gone":
+            await _cleanup_after_bot_gone(chat_id)
+            return {"ok": True, "chat_id": chat_id, "already_left": True, "bot": BOT_DISPLAY_LABEL, "error": None}
+        return {"ok": False, "error": str(leave_error) or "نامشخص", "bot": BOT_DISPLAY_LABEL}
     try:
         asyncio.create_task(registry_leave_group(chat_id))
     except Exception:
         pass
-    return {"ok": True, "chat_id": chat_id, "error": None}
+    return {"ok": True, "chat_id": chat_id, "bot": BOT_DISPLAY_LABEL, "error": None}
 
 
 async def migrate_legacy_unmarked_group_ids():
@@ -4333,6 +4684,15 @@ async def perform_admin_panel_command(action, chat_id, payload=None):
         chat_id = int(chat_id)
     except (TypeError, ValueError):
         return {"ok": False, "error": "chat_id نامعتبر."}
+
+    if action == "auth":
+        bot_state = await bot_membership_state(chat_id)
+        if bot_state == "gone":
+            asyncio.create_task(_cleanup_after_bot_gone(chat_id))
+            return {"ok": True, "authorized": False, "level": "unknown", "bot_state": "gone", "bot": BOT_DISPLAY_LABEL}
+        level = await get_panel_access_level(chat_id, payload.get("uid"), fresh=bool(payload.get("fresh")))
+        return {"ok": True, "authorized": level in PANEL_ALLOWED_LEVELS, "level": level,
+                "bot_state": bot_state, "bot": BOT_DISPLAY_LABEL}
 
     if action == "activity":
         try:
@@ -4658,6 +5018,201 @@ async def panel_report_loop():
         await _panel_send_report(first_attempt=False)
 
 
+# ===================== اجرای هم‌زمانِ دستورهای پنل =====================
+# قبلاً panel_broadcast_loop هر دستور (جوین/چکِ عضویت/خروج/دستورِ پنلِ گروهی) رو
+# با await داخلِ خودِ حلقه اجرا می‌کرد؛ یعنی یک جوینِ ~۴۰ ثانیه‌ای همه‌ی کلیک‌ها و
+# لفت‌های بعدیِ همین سلف رو معطل می‌کرد. الان هر دستور توی task جداگانه اجرا می‌شه
+# و حلقه بلافاصله سراغِ poll بعدی می‌ره. محدودیت‌ها:
+#   • جوین: حداکثر PANEL_JOIN_CONCURRENCY هم‌زمان (احتیاط برای flood-wait)
+#   • بقیه: حداکثر PANEL_CMD_CONCURRENCY هم‌زمان
+#   • دو دستور روی «یک لینک» یا «یک گروه» همچنان پشت‌سرهم اجرا می‌شن (قفلِ کلیددار)
+#   • دستوری که manager دیگه منتظرش نیست (expires_in تموم شده) اجرا نمی‌شه؛ وگرنه
+#     ممکن بود ربات عضوِ گروهی بشه که هیچ‌وقت ثبت نمی‌شه.
+# restart و broadcast (پیام همگانی) عمداً مثلِ قبل داخلِ حلقه اجرا می‌شن.
+import contextlib
+
+_PANEL_CONCURRENT_TYPES = ("join_test", "check_membership", "leave_group", "panel_group_cmd")
+PANEL_JOIN_CONCURRENCY = 3
+PANEL_CMD_CONCURRENCY = 16
+_PANEL_JOIN_SEM = asyncio.Semaphore(PANEL_JOIN_CONCURRENCY)
+_PANEL_CMD_SEM = asyncio.Semaphore(PANEL_CMD_CONCURRENCY)
+_PANEL_TASKS_INFLIGHT = set()   # bcast_id هایی که همین الان در حالِ اجران
+_PANEL_DONE_RESULTS = {}        # bcast_id -> نتیجه (برای ack مجدد اگه ack قبلی گم شد)
+_PANEL_DONE_MAX = 300
+_PANEL_BG_TASKS = set()         # نگه‌داشتنِ ارجاع به taskها تا garbage-collect نشن
+_PANEL_KEY_LOCKS = {}           # key -> [asyncio.Lock, تعدادِ منتظرها/دارنده‌ها]
+
+
+@contextlib.asynccontextmanager
+async def _panel_key_lock(key):
+    """قفلِ مخصوصِ یک کلید (مثلاً یک لینک یا یک chat_id)؛ کلیدِ None = بدونِ قفل."""
+    if key is None:
+        yield
+        return
+    entry = _PANEL_KEY_LOCKS.get(key)
+    if entry is None:
+        entry = _PANEL_KEY_LOCKS[key] = [asyncio.Lock(), 0]
+    entry[1] += 1
+    try:
+        async with entry[0]:
+            yield
+    finally:
+        entry[1] -= 1
+        if entry[1] <= 0:
+            _PANEL_KEY_LOCKS.pop(key, None)
+
+
+def _panel_time_left(expire_at, cap):
+    """چقدر وقت مونده؛ اگه manager مهلتی نفرستاده باشه همون سقفِ قبلی (cap)."""
+    if expire_at is None:
+        return cap
+    return min(cap, expire_at - time.monotonic())
+
+
+async def _execute_panel_command(command_type, text, expire_at):
+    """منطقِ دقیقاً همون منطقِ قبلیِ هر دستوره (فقط از حلقه بیرون اومده)؛ نتیجه‌ی
+    dict رو برمی‌گردونه. تایم‌اوت‌های داخلی هم به مهلتِ باقی‌مونده محدود شدن."""
+    global _PANEL_JOINS_IN_FLIGHT
+    expired = {"ok": False, "error": "درخواست منقضی شد؛ صفِ این سلف شلوغ بود."}
+    slow = {"ok": False, "error": "عملیات بیش از حد طول کشید (timeout داخلی)."}
+    try:
+        if command_type == "join_test":
+            join_link, join_req_uid = text, None
+            if text.lstrip().startswith("{"):
+                try:
+                    _jp = json.loads(text)
+                    join_link, join_req_uid = _jp.get("link"), _jp.get("uid")
+                except Exception:
+                    join_link, join_req_uid = text, None
+            key = None
+            try:
+                _l, _ident = _extract_group_link(join_link)
+                key = ("link", str(_ident).lower()) if _ident else None
+            except Exception:
+                key = None
+            async with _panel_key_lock(key):
+                async with _PANEL_JOIN_SEM:
+                    left = _panel_time_left(expire_at, 40)
+                    if left < 2:
+                        return expired
+                    _PANEL_JOINS_IN_FLIGHT += 1
+                    try:
+                        return await asyncio.wait_for(
+                            perform_admin_join_test(join_link, join_req_uid), timeout=left
+                        )
+                    except asyncio.TimeoutError:
+                        return slow
+                    finally:
+                        _PANEL_JOINS_IN_FLIGHT = max(0, _PANEL_JOINS_IN_FLIGHT - 1)
+
+        if command_type == "check_membership":
+            try:
+                check_payload = json.loads(text)
+                check_link = check_payload.get("link")
+                check_uid = check_payload.get("uid")
+            except Exception:
+                # سازگاری با فرمتِ قدیمی‌تر (فقط خودِ لینک، بدون uid)
+                check_link, check_uid = text, None
+            async with _PANEL_CMD_SEM:
+                left = _panel_time_left(expire_at, 15)
+                if left < 1:
+                    return expired
+                try:
+                    return await asyncio.wait_for(perform_membership_check(check_link, check_uid), timeout=left)
+                except asyncio.TimeoutError:
+                    return slow
+
+        if command_type == "leave_group":
+            async with _panel_key_lock(("chat", str(text).strip())):
+                async with _PANEL_CMD_SEM:
+                    left = _panel_time_left(expire_at, 20)
+                    if left < 1:
+                        return expired
+                    try:
+                        return await asyncio.wait_for(perform_admin_leave_group(text), timeout=left)
+                    except asyncio.TimeoutError:
+                        return slow
+
+        if command_type == "panel_group_cmd":
+            try:
+                cmd = json.loads(text)
+            except Exception:
+                cmd = {}
+            key = ("chat", str(cmd.get("chat_id")).strip()) if cmd.get("chat_id") is not None else None
+            async with _panel_key_lock(key):
+                async with _PANEL_CMD_SEM:
+                    left = _panel_time_left(expire_at, 20)
+                    if left < 1:
+                        return expired
+                    try:
+                        return await asyncio.wait_for(
+                            perform_admin_panel_command(cmd.get("action", "get"), cmd.get("chat_id"), cmd.get("payload") or {}),
+                            timeout=left,
+                        )
+                    except asyncio.TimeoutError:
+                        return slow
+
+        return {"ok": False, "error": "نوع دستور ناشناخته."}
+    except Exception as e:
+        return {"ok": False, "error": f"خطای داخلی سلف: {e}"}
+
+
+async def _post_panel_ack(bcast_id, result):
+    result = result or {"ok": False, "error": "بدون نتیجه."}
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            ack_payload = {
+                "bot_id": PANEL_BOT_ID, "secret": PANEL_SECRET,
+                "broadcast_id": bcast_id,
+                "sent_count": 1 if result.get("ok") else 0,
+                "failed_count": 0 if result.get("ok") else 1,
+                "join_result": result,
+            }
+            await session.post(f"{PANEL_API_URL}/broadcast/ack", json=ack_payload)
+        return True
+    except Exception as e:
+        safe_print(f"[panel_command] خطا در تایید نتیجه (id={bcast_id}) به پنل: {e}")
+        return False
+
+
+async def _panel_command_task(bcast_id, command_type, text, expire_at):
+    result = None
+    try:
+        result = await _execute_panel_command(command_type, text, expire_at)
+    except Exception as e:
+        result = {"ok": False, "error": f"خطای داخلی سلف: {e}"}
+    finally:
+        # این دو خط بدونِ await بینشون‌اند: یک دستورِ تکراری همیشه یا «در حالِ اجرا»
+        # می‌بینه یا «انجام‌شده»، هیچ‌وقت هیچ‌کدوم.
+        _PANEL_DONE_RESULTS[bcast_id] = result or {"ok": False, "error": "بدون نتیجه."}
+        _PANEL_TASKS_INFLIGHT.discard(bcast_id)
+        while len(_PANEL_DONE_RESULTS) > _PANEL_DONE_MAX:
+            _PANEL_DONE_RESULTS.pop(next(iter(_PANEL_DONE_RESULTS)), None)
+    await _post_panel_ack(bcast_id, _PANEL_DONE_RESULTS.get(bcast_id))
+    safe_print(f"[panel_command] {command_type} (id={bcast_id}) تمام شد: ok={bool((result or {}).get('ok'))}")
+
+
+def _dispatch_panel_command(bcast_id, command_type, text, expires_in):
+    """یک task برای دستور می‌سازه. خروجی: started | inflight | done
+    (دو حالتِ آخر یعنی manager همین دستور رو دوباره تحویل داده)."""
+    if bcast_id in _PANEL_TASKS_INFLIGHT:
+        return "inflight"
+    if bcast_id in _PANEL_DONE_RESULTS:
+        return "done"
+    expire_at = None
+    if expires_in is not None:
+        try:
+            expire_at = time.monotonic() + float(expires_in)
+        except (TypeError, ValueError):
+            expire_at = None
+    _PANEL_TASKS_INFLIGHT.add(bcast_id)
+    task = asyncio.create_task(_panel_command_task(bcast_id, command_type, text, expire_at))
+    _PANEL_BG_TASKS.add(task)
+    task.add_done_callback(_PANEL_BG_TASKS.discard)
+    return "started"
+
+
 async def panel_broadcast_loop():
     """اگه پنل مرکزی تنظیم شده باشه، هر چند ثانیه یک‌بار چک می‌کنه آیا از پنل یک
     دستور تازه (پیام همگانی یا ری‌استارت) ثبت شده یا نه. اگه بود، دقیقاً مثل
@@ -4691,7 +5246,19 @@ async def panel_broadcast_loop():
                 command_type = data.get("command_type") or "broadcast"
                 text = data.get("message") or ""
 
-                if bcast_id == _panel_last_applied_broadcast_id:
+                if command_type in _PANEL_CONCURRENT_TYPES and text:
+                    # دستورِ پنل: توی task جدا اجرا می‌شه و حلقه همین‌جا آزاده (بدونِ await روی خودِ دستور).
+                    _state = _dispatch_panel_command(bcast_id, command_type, text, data.get("expires_in"))
+                    if _state == "done":
+                        # تحویلِ مجدد: ack قبلی احتمالاً گم شده؛ با همون نتیجه‌ی ذخیره‌شده دوباره می‌فرستیم.
+                        await _post_panel_ack(bcast_id, _PANEL_DONE_RESULTS.get(bcast_id))
+                        await asyncio.sleep(0.5)
+                    elif _state == "inflight":
+                        await asyncio.sleep(0.5)   # جلوی poll پرتکرار روی همون دستور (مثلاً manager قدیمی)
+                    else:
+                        safe_print(f"[panel_broadcast_loop] دستور {command_type} (id={bcast_id}) در پس‌زمینه شروع شد.")
+
+                elif bcast_id == _panel_last_applied_broadcast_id:
                     # قبلاً همین دستور رو اجرا کرده بودیم (احتمالاً تاییدش
                     # به سرور نرسیده بود) - فقط دوباره تاییدش رو می‌فرستیم،
                     # بدون اینکه دوباره اجراش کنیم.
@@ -4727,115 +5294,6 @@ async def panel_broadcast_loop():
                         safe_print(f"[panel_broadcast_loop] خطا در تایید دریافت دستور ری‌استارت به پنل (بی‌ضرر - سرور دفعه‌ی بعد دوباره چک می‌کنه): {e}")
                     os.execv(sys.executable, [sys.executable] + sys.argv)
                     return  # هیچ‌وقت به اینجا نمی‌رسه (execv جایگزین کل پروسه می‌شه)
-
-                elif command_type == "join_test" and text:
-                    safe_print(f"[panel_broadcast_loop] دستورِ تستِ جوینِ لینک از پنل دریافت شد (id={bcast_id})؛ در حال تلاش...")
-                    try:
-                        join_result = await asyncio.wait_for(perform_admin_join_test(text), timeout=20)
-                    except asyncio.TimeoutError:
-                        join_result = {"ok": False, "error": "عملیات بیش از حد طول کشید (timeout داخلی)."}
-                    _panel_last_applied_broadcast_id = bcast_id
-                    _save_last_applied_command_id(bcast_id)
-                    try:
-                        timeout2 = aiohttp.ClientTimeout(total=10)
-                        async with aiohttp.ClientSession(timeout=timeout2) as session:
-                            ack_payload = {
-                                "bot_id": PANEL_BOT_ID, "secret": PANEL_SECRET,
-                                "broadcast_id": bcast_id,
-                                "sent_count": 1 if join_result.get("ok") else 0,
-                                "failed_count": 0 if join_result.get("ok") else 1,
-                                "join_result": join_result,
-                            }
-                            await session.post(f"{PANEL_API_URL}/broadcast/ack", json=ack_payload)
-                    except Exception as e:
-                        safe_print(f"[panel_broadcast_loop] خطا در تایید نتیجه‌ی تستِ جوین به پنل: {e}")
-                    safe_print(f"[panel_broadcast_loop] نتیجه‌ی تستِ جوین: {join_result}")
-
-                elif command_type == "check_membership" and text:
-                    safe_print(f"[panel_broadcast_loop] دستورِ چکِ عضویتِ لینک از پنل دریافت شد (id={bcast_id})؛ در حال بررسی...")
-                    try:
-                        check_payload = json.loads(text)
-                        check_link = check_payload.get("link")
-                        check_uid = check_payload.get("uid")
-                    except Exception:
-                        # سازگاری با فرمتِ قدیمی‌تر (فقط خودِ لینک، بدون uid) -
-                        # در این حالت چکِ ادمین/سازنده انجام نمی‌شه.
-                        check_link, check_uid = text, None
-                    try:
-                        membership_result = await asyncio.wait_for(
-                            perform_membership_check(check_link, check_uid), timeout=15
-                        )
-                    except asyncio.TimeoutError:
-                        membership_result = {"ok": False, "error": "عملیات بیش از حد طول کشید (timeout داخلی)."}
-                    _panel_last_applied_broadcast_id = bcast_id
-                    _save_last_applied_command_id(bcast_id)
-                    try:
-                        timeout2 = aiohttp.ClientTimeout(total=10)
-                        async with aiohttp.ClientSession(timeout=timeout2) as session:
-                            ack_payload = {
-                                "bot_id": PANEL_BOT_ID, "secret": PANEL_SECRET,
-                                "broadcast_id": bcast_id,
-                                "sent_count": 1 if membership_result.get("ok") else 0,
-                                "failed_count": 0 if membership_result.get("ok") else 1,
-                                "join_result": membership_result,
-                            }
-                            await session.post(f"{PANEL_API_URL}/broadcast/ack", json=ack_payload)
-                    except Exception as e:
-                        safe_print(f"[panel_broadcast_loop] خطا در تایید نتیجه‌ی چکِ عضویت به پنل: {e}")
-                    safe_print(f"[panel_broadcast_loop] نتیجه‌ی چکِ عضویت: {membership_result}")
-
-                elif command_type == "leave_group" and text:
-                    safe_print(f"[panel_broadcast_loop] دستورِ خروج از گروه از پنل دریافت شد (id={bcast_id})؛ در حال تلاش...")
-                    try:
-                        leave_result = await asyncio.wait_for(perform_admin_leave_group(text), timeout=20)
-                    except asyncio.TimeoutError:
-                        leave_result = {"ok": False, "error": "عملیات بیش از حد طول کشید (timeout داخلی)."}
-                    _panel_last_applied_broadcast_id = bcast_id
-                    _save_last_applied_command_id(bcast_id)
-                    try:
-                        timeout2 = aiohttp.ClientTimeout(total=10)
-                        async with aiohttp.ClientSession(timeout=timeout2) as session:
-                            ack_payload = {
-                                "bot_id": PANEL_BOT_ID, "secret": PANEL_SECRET,
-                                "broadcast_id": bcast_id,
-                                "sent_count": 1 if leave_result.get("ok") else 0,
-                                "failed_count": 0 if leave_result.get("ok") else 1,
-                                "join_result": leave_result,
-                            }
-                            await session.post(f"{PANEL_API_URL}/broadcast/ack", json=ack_payload)
-                    except Exception as e:
-                        safe_print(f"[panel_broadcast_loop] خطا در تایید نتیجه‌ی خروج از گروه به پنل: {e}")
-                    safe_print(f"[panel_broadcast_loop] نتیجه‌ی خروج از گروه: {leave_result}")
-
-                elif command_type == "panel_group_cmd" and text:
-                    safe_print(f"[panel_broadcast_loop] دستورِ پنلِ گروهی از پنل دریافت شد (id={bcast_id})؛ در حال اجرا...")
-                    try:
-                        cmd = json.loads(text)
-                    except Exception:
-                        cmd = {}
-                    try:
-                        cmd_result = await asyncio.wait_for(
-                            perform_admin_panel_command(cmd.get("action", "get"), cmd.get("chat_id"), cmd.get("payload") or {}),
-                            timeout=20,
-                        )
-                    except asyncio.TimeoutError:
-                        cmd_result = {"ok": False, "error": "عملیات بیش از حد طول کشید (timeout داخلی)."}
-                    _panel_last_applied_broadcast_id = bcast_id
-                    _save_last_applied_command_id(bcast_id)
-                    try:
-                        timeout2 = aiohttp.ClientTimeout(total=10)
-                        async with aiohttp.ClientSession(timeout=timeout2) as session:
-                            ack_payload = {
-                                "bot_id": PANEL_BOT_ID, "secret": PANEL_SECRET,
-                                "broadcast_id": bcast_id,
-                                "sent_count": 1 if cmd_result.get("ok") else 0,
-                                "failed_count": 0 if cmd_result.get("ok") else 1,
-                                "join_result": cmd_result,
-                            }
-                            await session.post(f"{PANEL_API_URL}/broadcast/ack", json=ack_payload)
-                    except Exception as e:
-                        safe_print(f"[panel_broadcast_loop] خطا در تایید نتیجه‌ی دستورِ پنلِ گروهی به پنل: {e}")
-                    safe_print(f"[panel_broadcast_loop] نتیجه‌ی دستورِ پنلِ گروهی: {cmd_result.get('ok')}")
 
                 elif command_type == "broadcast" and text:
                     safe_print(f"[panel_broadcast_loop] پیام همگانی جدید از پنل دریافت شد (id={bcast_id})؛ در حال ارسال...")
@@ -6062,39 +6520,10 @@ async def on_chat_action(_client, event):
                         await _try_leave_chat(leave_entity, chat_id)
                         continue
 
-                # نکته: قبلاً اینجا sync_group_admins(chat_id) صدا زده می‌شد تا ادمین‌های
-                # واقعیِ گروه بدون نیاز به تنظیم دستی شناخته بشن. اون تابع ادمین‌های واقعی
-                # رو مستقیم توی جدول group_admins ثبت می‌کرد - همون جدولی که الان تیر
-                # «ویژه» (تنظیم ویژه/حذف ویژه/لیست ویژه) رو نگه می‌داره. نتیجه‌ش این بود که
-                # «لیست ویژه» به‌جای فقط کسایی که با «تنظیم ویژه» مشخص شدن، همه‌ی ادمین‌های
-                # واقعیِ گروه رو هم نشون می‌داد. مجوزدهی (is_admin) از قبل با چک زنده‌ی
-                # user_permission تشخیص داده می‌شه، پس نیازی به این ثبتِ خودکار نبود؛ برای
-                # همین این فراخوانی حذف شد تا جدول group_admins فقط با «تنظیم ویژه» پر بشه.
-                try:
-                    await client.send_message(chat_id, f"""👋 **سلام به گروه!**
-
-🤖 ربات مدیریت گروه با موفقیت اضافه شد!
-
-📋 **برای فعال‌سازی ربات، بنویسید:** `فعال`
-
-🔒 **نکته:** اولین کسی که `فعال` رو بنویسه، مالک گروه میشه!
-
-🎮 **بازی دوز نیز اضافه شده!** 
-برای شروع: `دوز`
-
-🛡️ **مدیریت خودکار:** `وضعیت خودکار`
-
-📌 {CHANNEL_LINK}
-""")
-                except:
-                    pass
-
-                if GROUP_REGISTRY_API_URL:
-                    try:
-                        group_title = getattr(await client.get_entity(chat_id), 'title', None)
-                    except Exception:
-                        group_title = None
-                    asyncio.create_task(registry_announce_group(chat_id, group_title))
+                # فعال‌سازیِ خودکار (بدون نیاز به نوشتنِ «فعال»): مالکِ واقعی و ادمین‌های
+                # گروه از سروش گرفته و ثبت می‌شن؛ اگه همزمان یک جوینِ پنل در حالِ چکِ
+                # ادمین باشه، تا پایانِ چک صبر می‌کنه (_on_bot_added_to_group).
+                asyncio.create_task(_on_bot_added_to_group(chat_id))
             else:
                 await greet_new_member(chat_id, uid)
                 mark_member_seen(chat_id, uid)
